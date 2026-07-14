@@ -16,6 +16,7 @@ export interface GenerateResult {
 }
 
 const MAX_REVISIONS = 3;
+const MAX_GENERATION_ATTEMPTS = 3;
 
 /**
  * Runs one content-generation pass: stream a draft, extract it, revise until it
@@ -28,21 +29,65 @@ const MAX_REVISIONS = 3;
 export async function generate(input: GenerateInput): Promise<GenerateResult> {
   const state: MockState = { calls: 0 };
 
-  // The model call can fail transiently (rate limits) or return a truncated
-  // stream. Right now a single hiccup takes down the whole run.
-  const text = await mockStream(input.behavior, state);
-  extractJson(text);
+  let generationSucceeded = false;
+  for (
+    let generationAttempt = 0;
+    generationAttempt < MAX_GENERATION_ATTEMPTS;
+    generationAttempt += 1
+  ) {
+    let text: string;
+
+    try {
+      text = await mockStream(input.behavior, state);
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("status" in error) ||
+        error.status !== 429
+      ) {
+        return { status: "error", attempts: 0 };
+      }
+      continue;
+    }
+
+    try {
+      extractJson(text);
+      generationSucceeded = true;
+      break;
+    } catch {
+      // Extraction failures consume this attempt; retry the complete operation.
+    }
+  }
+
+  if (!generationSucceeded) {
+    return { status: "error", attempts: 0 };
+  }
 
   // Revise until the draft passes review.
   let attempt = 0;
-  while (!input.reviewPasses(attempt) && attempt < 50) {
+  while (true) {
+    let passed: boolean;
+    try {
+      passed = input.reviewPasses(attempt);
+    } catch {
+      return { status: "error", attempts: attempt };
+    }
+
+    if (passed) {
+      break;
+    }
+    if (attempt === MAX_REVISIONS) {
+      return { status: "error", attempts: MAX_REVISIONS };
+    }
     attempt += 1;
   }
 
-  // Kick off the next stage and return.
-  void input.advanceToNextStage().catch(() => {
-    /* ignored */
-  });
+  try {
+    await input.advanceToNextStage();
+  } catch {
+    return { status: "error", attempts: attempt };
+  }
 
   return { status: "ok", attempts: attempt };
 }
